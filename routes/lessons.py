@@ -404,7 +404,7 @@ def create_lesson(course_id):
             course_id=course_id,
             lesson_title=data["title"].strip(),
         )
-        lesson["video_file_id"] = str(file_id)
+        lesson["video_file_id"] = file_id
         lesson["video_mime"]    = video_file.mimetype
 
     if note_file and note_file.filename:
@@ -477,7 +477,7 @@ def update_lesson(lesson_id):
             filename=video_file.filename,
             content_type=video_file.mimetype,
         )
-        update["video_file_id"] = str(file_id)
+        update["video_file_id"] = file_id
         update["video_mime"]    = video_file.mimetype
 
     if note_file and note_file.filename:
