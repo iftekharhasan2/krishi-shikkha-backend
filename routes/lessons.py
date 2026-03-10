@@ -1,10 +1,12 @@
-from flask import Blueprint, request, jsonify, Response, stream_with_context
+from flask import Blueprint, request, jsonify, redirect
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from config.db import get_db, get_fs
+from config.db import get_db
 from bson import ObjectId
 from bson.errors import InvalidId
 import struct
 from datetime import datetime
+import cloudinary.uploader
+import cloudinary.utils
 
 lessons_bp = Blueprint("lessons", __name__)
 
@@ -42,12 +44,12 @@ def get_video_duration_from_bytes(video_bytes):
         pass
     return 0
 
-def delete_gridfs_file(fs, file_id):
-    """Safely delete a GridFS file by its ObjectId."""
-    if not file_id:
+def delete_cloudinary_asset(public_id, resource_type="video"):
+    """Safely delete a Cloudinary asset by public_id."""
+    if not public_id:
         return
     try:
-        fs.delete(ObjectId(file_id) if not isinstance(file_id, ObjectId) else file_id)
+        cloudinary.uploader.destroy(public_id, resource_type=resource_type)
     except Exception:
         pass
 
@@ -69,6 +71,23 @@ def check_access(db, lesson, user_id, user):
     is_enrolled = lesson["course_id"] in user.get("enrolled_courses", [])
 
     return is_instructor or is_enrolled or is_first, is_first, None
+
+def make_signed_url(public_id, resource_type="video", expires_in=3600):
+    """
+    Generate a short-lived signed Cloudinary URL for private assets.
+    Falls back to the stored URL if signing fails.
+    """
+    try:
+        url, _ = cloudinary.utils.cloudinary_url(
+            public_id,
+            resource_type=resource_type,
+            type="upload",
+            sign_url=True,
+            expires_at=int(datetime.utcnow().timestamp()) + expires_in,
+        )
+        return url
+    except Exception:
+        return None
 
 
 # ── GET /api/lessons/course/<course_id> ────────────────────────────────────
@@ -97,6 +116,7 @@ def get_lessons(course_id):
     for i, l in enumerate(lessons_raw):
         is_free    = i == 0
         has_access = is_instructor or is_enrolled or is_free
+
         lesson_data = {
             "id":            str(l["_id"]),
             "title":         l["title"],
@@ -105,12 +125,15 @@ def get_lessons(course_id):
             "duration":      l.get("duration", 0),
             "is_free":       is_free,
             "has_access":    has_access,
-            "has_video":     bool(l.get("video_file_id")),
-            "has_note":      bool(l.get("note_filename")),
+            "has_video":     bool(l.get("video_url")),
+            "has_note":      bool(l.get("note_url")),
             "note_filename": l.get("note_filename") if has_access else None,
         }
-        if has_access and l.get("video_file_id"):
-            lesson_data["video_url"] = f"/api/lessons/{str(l['_id'])}/video"
+        if has_access and l.get("video_public_id"):
+            lesson_data["video_url"] = make_signed_url(l["video_public_id"], "video")
+        if has_access and l.get("note_public_id"):
+            lesson_data["note_url"] = make_signed_url(l["note_public_id"], "raw")
+
         lessons.append(lesson_data)
     return jsonify(lessons)
 
@@ -136,6 +159,14 @@ def get_lesson(lesson_id):
     if not has_access:
         return jsonify({"error": "প্রবেশাধিকার নেই"}), 403
 
+    video_url = None
+    if has_access and lesson.get("video_public_id"):
+        video_url = make_signed_url(lesson["video_public_id"], "video")
+
+    note_url = None
+    if has_access and lesson.get("note_public_id"):
+        note_url = make_signed_url(lesson["note_public_id"], "raw")
+
     return jsonify({
         "id":            str(lesson["_id"]),
         "title":         lesson["title"],
@@ -143,202 +174,13 @@ def get_lesson(lesson_id):
         "order":         lesson.get("order", 0),
         "duration":      lesson.get("duration", 0),
         "is_free":       is_first,
-        "has_video":     bool(lesson.get("video_file_id")),
-        "video_url":     f"/api/lessons/{lesson_id}/video" if lesson.get("video_file_id") else None,
-        "has_note":      bool(lesson.get("note_filename")),
+        "has_video":     bool(lesson.get("video_url")),
+        "video_url":     video_url,
+        "has_note":      bool(lesson.get("note_url")),
+        "note_url":      note_url,
         "note_filename": lesson.get("note_filename"),
         "course_id":     lesson["course_id"],
     })
-
-
-# ── GET /api/lessons/<lesson_id>/video  (GridFS streaming) ────────────────
-
-@lessons_bp.route("/<lesson_id>/video", methods=["GET"])
-@jwt_required(optional=True)
-def stream_video(lesson_id):
-    from flask_jwt_extended import decode_token
-    db  = get_db()
-    fs  = get_fs()
-
-    # Support token as query param for browser <video> tags (can't send headers)
-    user_id = get_jwt_identity()
-    if not user_id:
-        token_param = request.args.get("token")
-        if token_param:
-            try:
-                decoded = decode_token(token_param)
-                user_id = decoded.get("sub")
-            except Exception:
-                return jsonify({"error": "অবৈধ টোকেন"}), 401
-    if not user_id:
-        return jsonify({"error": "প্রবেশাধিকার প্রয়োজন"}), 401
-
-    user = get_user_safe(db, user_id)
-    if not user:
-        return jsonify({"error": "ব্যবহারকারী পাওয়া যায়নি"}), 401
-
-    lesson = get_doc_safe(db, "lessons", lesson_id)
-    if not lesson or not lesson.get("video_file_id"):
-        return jsonify({"error": "ভিডিও পাওয়া যায়নি"}), 404
-
-    has_access, _, err = check_access(db, lesson, user_id, user)
-    if err:
-        return jsonify({"error": err}), 404
-    if not has_access:
-        return jsonify({"error": "প্রবেশাধিকার নেই"}), 403
-
-    # Retrieve GridFS file
-    try:
-        grid_out = fs.get(ObjectId(lesson["video_file_id"]))
-    except Exception:
-        return jsonify({"error": "ভিডিও ফাইল পাওয়া যায়নি"}), 404
-
-    mime_type  = lesson.get("video_mime", "video/mp4")
-    total_size = grid_out.length
-
-    range_header = request.headers.get("Range")
-
-    CHUNK = 65536  # 64 KB
-
-    # pymongo 4.x GridFS gridout does NOT support .seek().
-    # We read sequentially, skipping bytes until start, then yield until end.
-    def _stream(start_byte, end_byte):
-        """Generator: skip to start_byte, then yield through end_byte."""
-        remaining_skip = start_byte
-        remaining_read = end_byte - start_byte + 1
-        # Re-open grid file each time (gridout cursor is forward-only)
-        try:
-            gf = fs.get(ObjectId(lesson["video_file_id"]))
-        except Exception:
-            return
-        try:
-            # Skip bytes before range start
-            while remaining_skip > 0:
-                to_skip = min(CHUNK, remaining_skip)
-                chunk = gf.read(to_skip)
-                if not chunk:
-                    return
-                remaining_skip -= len(chunk)
-            # Yield bytes in range
-            while remaining_read > 0:
-                to_read = min(CHUNK, remaining_read)
-                chunk = gf.read(to_read)
-                if not chunk:
-                    return
-                remaining_read -= len(chunk)
-                yield chunk
-        finally:
-            gf.close()
-
-    def _stream_full():
-        try:
-            gf = fs.get(ObjectId(lesson["video_file_id"]))
-        except Exception:
-            return
-        try:
-            while True:
-                chunk = gf.read(CHUNK)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            gf.close()
-
-    if range_header:
-        try:
-            parts = range_header.replace("bytes=", "").split("-")
-            start = int(parts[0])
-            end   = int(parts[1]) if parts[1] else total_size - 1
-            end   = min(end, total_size - 1)
-            if start > end or start >= total_size:
-                return Response(
-                    status=416,
-                    headers={"Content-Range": f"bytes */{total_size}"}
-                )
-            length = end - start + 1
-            return Response(
-                stream_with_context(_stream(start, end)),
-                status=206,
-                mimetype=mime_type,
-                headers={
-                    "Content-Range":  f"bytes {start}-{end}/{total_size}",
-                    "Accept-Ranges":  "bytes",
-                    "Content-Length": str(length),
-                    "Content-Type":   mime_type,
-                    "Cache-Control":  "no-store",
-                }
-            )
-        except (ValueError, IndexError):
-            pass  # fall through to full stream
-
-    return Response(
-        stream_with_context(_stream_full()),
-        status=200,
-        mimetype=mime_type,
-        headers={
-            "Accept-Ranges":  "bytes",
-            "Content-Length": str(total_size),
-            "Content-Type":   mime_type,
-            "Cache-Control":  "no-store",
-        }
-    )
-
-
-# ── GET /api/lessons/<lesson_id>/note ─────────────────────────────────────
-
-@lessons_bp.route("/<lesson_id>/note", methods=["GET"])
-@jwt_required(optional=True)
-def download_note(lesson_id):
-    from flask_jwt_extended import decode_token
-    db  = get_db()
-    fs  = get_fs()
-
-    user_id = get_jwt_identity()
-    if not user_id:
-        token_param = request.args.get("token")
-        if token_param:
-            try:
-                decoded = decode_token(token_param)
-                user_id = decoded.get("sub")
-            except Exception:
-                return jsonify({"error": "অবৈধ টোকেন"}), 401
-    if not user_id:
-        return jsonify({"error": "প্রবেশাধিকার প্রয়োজন"}), 401
-
-    user = get_user_safe(db, user_id)
-    if not user:
-        return jsonify({"error": "ব্যবহারকারী পাওয়া যায়নি"}), 401
-
-    lesson = get_doc_safe(db, "lessons", lesson_id)
-    if not lesson or not lesson.get("note_file_id"):
-        return jsonify({"error": "নোট পাওয়া যায়নি"}), 404
-
-    has_access, _, err = check_access(db, lesson, user_id, user)
-    if err:
-        return jsonify({"error": err}), 404
-    if not has_access:
-        return jsonify({"error": "প্রবেশাধিকার নেই"}), 403
-
-    try:
-        grid_out = fs.get(ObjectId(lesson["note_file_id"]))
-    except Exception:
-        return jsonify({"error": "নোট ফাইল পাওয়া যায়নি"}), 404
-
-    filename = lesson.get("note_filename", "note")
-    mime     = lesson.get("note_mime", "application/octet-stream")
-
-    def generate():
-        while True:
-            data = grid_out.read(65536)
-            if not data:
-                break
-            yield data
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype=mime,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
 
 
 # ── POST /api/lessons/course/<course_id>  (create lesson) ─────────────────
@@ -347,7 +189,6 @@ def download_note(lesson_id):
 @jwt_required()
 def create_lesson(course_id):
     db  = get_db()
-    fs  = get_fs()
     user_id = get_jwt_identity()
     user = get_user_safe(db, user_id)
     if not user:
@@ -377,45 +218,54 @@ def create_lesson(course_id):
         order = existing_count
 
     lesson = {
-        "course_id":    course_id,
-        "title":        data["title"].strip(),
-        "description":  data.get("description", "").strip(),
-        "order":        order,
-        "duration":     0,
-        # GridFS file IDs (replaces raw binary blobs)
-        "video_file_id": None,
-        "video_mime":    None,
-        "note_file_id":  None,
-        "note_filename": None,
-        "note_mime":     None,
-        "created_at":   datetime.utcnow(),
+        "course_id":      course_id,
+        "title":          data["title"].strip(),
+        "description":    data.get("description", "").strip(),
+        "order":          order,
+        "duration":       0,
+        "video_url":      None,
+        "video_public_id": None,
+        "note_url":       None,
+        "note_public_id": None,
+        "note_filename":  None,
+        "created_at":     datetime.utcnow(),
     }
 
     if video_file and video_file.filename:
-        # Read first 1MB to detect duration, then store full file in GridFS
-        header_bytes = video_file.read(1024 * 1024)   # 1 MB for header scan
+        # Read first 1MB to detect MP4 duration
+        header_bytes = video_file.read(1024 * 1024)
         lesson["duration"] = get_video_duration_from_bytes(header_bytes)
-        # Reset and store the entire file in GridFS
         video_file.seek(0)
-        file_id = fs.put(
-            video_file,
-            filename=video_file.filename,
-            content_type=video_file.mimetype,
-            course_id=course_id,
-            lesson_title=data["title"].strip(),
-        )
-        lesson["video_file_id"] = file_id
-        lesson["video_mime"]    = video_file.mimetype
+        try:
+            result = cloudinary.uploader.upload(
+                video_file,
+                folder=f"krishi_lms/videos/{course_id}",
+                resource_type="video",
+                use_filename=True,
+                unique_filename=True,
+            )
+            lesson["video_url"]       = result["secure_url"]
+            lesson["video_public_id"] = result["public_id"]
+            # Use Cloudinary duration if available and more accurate
+            if result.get("duration"):
+                lesson["duration"] = round(result["duration"])
+        except Exception as e:
+            return jsonify({"error": f"ভিডিও আপলোড করতে সমস্যা হয়েছে: {str(e)}"}), 500
 
     if note_file and note_file.filename:
-        file_id = fs.put(
-            note_file,
-            filename=note_file.filename,
-            content_type=note_file.mimetype,
-        )
-        lesson["note_file_id"]  = str(file_id)
-        lesson["note_filename"] = note_file.filename
-        lesson["note_mime"]     = note_file.mimetype
+        try:
+            result = cloudinary.uploader.upload(
+                note_file,
+                folder=f"krishi_lms/notes/{course_id}",
+                resource_type="raw",
+                use_filename=True,
+                unique_filename=True,
+            )
+            lesson["note_url"]       = result["secure_url"]
+            lesson["note_public_id"] = result["public_id"]
+            lesson["note_filename"]  = note_file.filename
+        except Exception as e:
+            return jsonify({"error": f"নোট আপলোড করতে সমস্যা হয়েছে: {str(e)}"}), 500
 
     result = db.lessons.insert_one(lesson)
     return jsonify({
@@ -431,7 +281,6 @@ def create_lesson(course_id):
 @jwt_required()
 def update_lesson(lesson_id):
     db  = get_db()
-    fs  = get_fs()
     user_id = get_jwt_identity()
     user = get_user_safe(db, user_id)
     if not user:
@@ -466,30 +315,41 @@ def update_lesson(lesson_id):
     note_file  = request.files.get("note")
 
     if video_file and video_file.filename:
-        # Delete old GridFS video file
-        delete_gridfs_file(fs, lesson.get("video_file_id"))
-        # Detect duration from first 1MB
+        # Delete old Cloudinary video
+        delete_cloudinary_asset(lesson.get("video_public_id"), "video")
         header_bytes = video_file.read(1024 * 1024)
         update["duration"] = get_video_duration_from_bytes(header_bytes)
         video_file.seek(0)
-        file_id = fs.put(
-            video_file,
-            filename=video_file.filename,
-            content_type=video_file.mimetype,
-        )
-        update["video_file_id"] = file_id
-        update["video_mime"]    = video_file.mimetype
+        try:
+            result = cloudinary.uploader.upload(
+                video_file,
+                folder=f"krishi_lms/videos/{lesson['course_id']}",
+                resource_type="video",
+                use_filename=True,
+                unique_filename=True,
+            )
+            update["video_url"]       = result["secure_url"]
+            update["video_public_id"] = result["public_id"]
+            if result.get("duration"):
+                update["duration"] = round(result["duration"])
+        except Exception as e:
+            return jsonify({"error": f"ভিডিও আপলোড করতে সমস্যা হয়েছে: {str(e)}"}), 500
 
     if note_file and note_file.filename:
-        delete_gridfs_file(fs, lesson.get("note_file_id"))
-        file_id = fs.put(
-            note_file,
-            filename=note_file.filename,
-            content_type=note_file.mimetype,
-        )
-        update["note_file_id"]  = str(file_id)
-        update["note_filename"] = note_file.filename
-        update["note_mime"]     = note_file.mimetype
+        delete_cloudinary_asset(lesson.get("note_public_id"), "raw")
+        try:
+            result = cloudinary.uploader.upload(
+                note_file,
+                folder=f"krishi_lms/notes/{lesson['course_id']}",
+                resource_type="raw",
+                use_filename=True,
+                unique_filename=True,
+            )
+            update["note_url"]       = result["secure_url"]
+            update["note_public_id"] = result["public_id"]
+            update["note_filename"]  = note_file.filename
+        except Exception as e:
+            return jsonify({"error": f"নোট আপলোড করতে সমস্যা হয়েছে: {str(e)}"}), 500
 
     db.lessons.update_one({"_id": ObjectId(lesson_id)}, {"$set": update})
     return jsonify({"message": "পাঠ আপডেট হয়েছে"})
@@ -501,7 +361,6 @@ def update_lesson(lesson_id):
 @jwt_required()
 def delete_lesson(lesson_id):
     db  = get_db()
-    fs  = get_fs()
     user_id = get_jwt_identity()
     user = get_user_safe(db, user_id)
     if not user:
@@ -519,9 +378,9 @@ def delete_lesson(lesson_id):
     if str(course["instructor_id"]) != user_id and user["role"] != "admin":
         return jsonify({"error": "অনুমতি নেই"}), 403
 
-    # Clean up GridFS files before deleting the lesson document
-    delete_gridfs_file(fs, lesson.get("video_file_id"))
-    delete_gridfs_file(fs, lesson.get("note_file_id"))
+    # Delete Cloudinary assets
+    delete_cloudinary_asset(lesson.get("video_public_id"), "video")
+    delete_cloudinary_asset(lesson.get("note_public_id"), "raw")
 
     db.lessons.delete_one({"_id": ObjectId(lesson_id)})
     return jsonify({"message": "পাঠ মুছে ফেলা হয়েছে"})

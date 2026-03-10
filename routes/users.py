@@ -3,11 +3,23 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from config.db import get_db
 from bson import ObjectId
 from bson.errors import InvalidId
-import base64
+import cloudinary.uploader
 
 users_bp = Blueprint("users", __name__)
 
 MAX_AVATAR_SIZE = 2 * 1024 * 1024  # 2 MB
+
+def _delete_cloudinary_image(url):
+    """Delete a Cloudinary image by URL (best-effort)."""
+    if not url or not url.startswith("https://res.cloudinary.com"):
+        return
+    try:
+        parts = url.split("/upload/")
+        if len(parts) == 2:
+            public_id = parts[1].split("/", 1)[-1].rsplit(".", 1)[0]
+            cloudinary.uploader.destroy(public_id, resource_type="image")
+    except Exception:
+        pass
 
 
 @users_bp.route("/profile", methods=["PUT"])
@@ -51,18 +63,35 @@ def upload_avatar():
 
     file = request.files["avatar"]
 
-    # Validate file type
     allowed_types = {"image/jpeg", "image/png", "image/gif", "image/webp"}
     if file.mimetype not in allowed_types:
         return jsonify({"error": "শুধুমাত্র JPG, PNG, GIF বা WebP ছবি আপলোড করুন"}), 400
 
-    data = file.read()
-
-    # Size check: max 2 MB
-    if len(data) > MAX_AVATAR_SIZE:
+    # Size check before uploading
+    file_bytes = file.read()
+    if len(file_bytes) > MAX_AVATAR_SIZE:
         return jsonify({"error": "ছবির আকার সর্বোচ্চ ২ মেগাবাইট হতে পারবে"}), 400
+    file.seek(0)
 
-    avatar_url = f"data:{file.mimetype};base64,{base64.b64encode(data).decode()}"
+    try:
+        # Delete old avatar from Cloudinary
+        user = db.users.find_one({"_id": ObjectId(user_id)}, {"avatar": 1})
+        if user and user.get("avatar"):
+            _delete_cloudinary_image(user["avatar"])
+
+        result = cloudinary.uploader.upload(
+            file,
+            folder="krishi_lms/avatars",
+            public_id=f"user_{user_id}",
+            overwrite=True,
+            resource_type="image",
+            transformation=[
+                {"width": 300, "height": 300, "crop": "fill", "gravity": "face", "quality": "auto"}
+            ],
+        )
+        avatar_url = result["secure_url"]
+    except Exception as e:
+        return jsonify({"error": f"আপলোড করতে সমস্যা হয়েছে: {str(e)}"}), 500
 
     try:
         db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"avatar": avatar_url}})
@@ -105,6 +134,6 @@ def enrolled_courses():
                     "category": course.get("category", "")
                 })
         except Exception:
-            pass  # Skip invalid course IDs
+            pass
 
     return jsonify(courses)

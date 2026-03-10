@@ -1,17 +1,15 @@
 from pymongo import MongoClient
-import gridfs
+import cloudinary
 import os, bcrypt, uuid
 from datetime import datetime
 
 client = None
 db = None
-fs = None   # GridFS instance for large files (videos, notes)
 
 def init_db():
-    global client, db, fs
+    global client, db
     client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/krishi_lms"))
     db = client.get_default_database()
-    fs = gridfs.GridFS(db)   # ← GridFS uses db.fs.files + db.fs.chunks internally
 
     # Indexes
     db.users.create_index("email", unique=True)
@@ -20,8 +18,22 @@ def init_db():
     db.lessons.create_index("course_id")
     db.payments.create_index([("user_id", 1), ("status", 1)])
 
+    _init_cloudinary()
     _seed_admin()
-    print("ডেটাবেস প্রস্তুত (GridFS সক্রিয়)")
+    print("ডেটাবেস প্রস্তুত (Cloudinary সক্রিয়)")
+
+def _init_cloudinary():
+    cloudinary.config(
+        cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", ""),
+        api_key=os.getenv("CLOUDINARY_API_KEY", ""),
+        api_secret=os.getenv("CLOUDINARY_API_SECRET", ""),
+        secure=True,
+    )
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+    if cloud_name:
+        print(f"✓ Cloudinary সংযুক্ত: {cloud_name}")
+    else:
+        print("⚠ CLOUDINARY credentials সেট নেই — ফাইল আপলোড কাজ করবে না")
 
 def _seed_admin():
     admin_email    = os.getenv("ADMIN_EMAIL",    "admin@krishividya.com")
@@ -46,7 +58,6 @@ def _seed_admin():
         })
         print(f"✓ অ্যাডমিন তৈরি: {admin_email}")
     else:
-        # Always sync password + ensure approved=True + role=admin on startup
         db.users.update_one(
             {"email": admin_email},
             {"$set": {
@@ -59,7 +70,3 @@ def _seed_admin():
 
 def get_db():
     return db
-
-def get_fs():
-    """Return the GridFS instance."""
-    return fs

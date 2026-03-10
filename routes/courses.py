@@ -1,15 +1,47 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from config.db import get_db, get_fs
+from config.db import get_db
 from bson import ObjectId
 from bson.errors import InvalidId
-import base64
 from datetime import datetime
+import cloudinary.uploader
 
 courses_bp = Blueprint("courses", __name__)
 
+# ── Cloudinary helpers ────────────────────────────────────────────────────
+
+def upload_thumbnail(file):
+    """Upload thumbnail image to Cloudinary. Returns secure_url or raises."""
+    raw = file.read()
+    if len(raw) > 5 * 1024 * 1024:
+        raise ValueError("থাম্বনেইল ৫ মেগাবাইটের বেশি হতে পারবে না")
+    file.seek(0)
+    result = cloudinary.uploader.upload(
+        file,
+        folder="krishi_lms/thumbnails",
+        resource_type="image",
+        allowed_formats=["jpg", "jpeg", "png", "webp", "gif"],
+        transformation=[{"width": 800, "height": 450, "crop": "fill", "quality": "auto"}],
+    )
+    return result["secure_url"]
+
+def delete_cloudinary_image(url):
+    """Delete a Cloudinary image by its URL (best-effort)."""
+    if not url or not url.startswith("https://res.cloudinary.com"):
+        return
+    try:
+        # Extract public_id from URL: .../upload/v123/<public_id>.<ext>
+        parts = url.split("/upload/")
+        if len(parts) == 2:
+            public_id = parts[1].split("/", 1)[-1].rsplit(".", 1)[0]
+            cloudinary.uploader.destroy(public_id, resource_type="image")
+    except Exception:
+        pass
+
+
+# ── Serializer ───────────────────────────────────────────────────────────
+
 def get_user_safe(db, user_id):
-    """Get user by JWT identity string, safe ObjectId conversion."""
     try:
         return db.users.find_one({"_id": ObjectId(user_id)})
     except (InvalidId, Exception):
@@ -32,9 +64,12 @@ def serialize_course(course, instructor=None, enrolled_count=0, lessons_count=0)
         "enrolled_count": enrolled_count,
         "lessons_count": lessons_count,
         "created_at": course["created_at"].isoformat() if course.get("created_at") else "",
-        "updated_at": (course.get("updated_at") or course.get("created_at", "")).isoformat() if course.get("updated_at") or course.get("created_at") else ""
+        "updated_at": (course.get("updated_at") or course.get("created_at", "")).isoformat()
+            if course.get("updated_at") or course.get("created_at") else ""
     }
 
+
+# ── Routes ───────────────────────────────────────────────────────────────
 
 @courses_bp.route("/", methods=["GET"])
 def get_all_courses():
@@ -92,8 +127,8 @@ def get_course(course_id):
             "order": l.get("order", i),
             "duration": l.get("duration", 0),
             "is_free": i == 0,
-            "has_video": bool(l.get("video_file_id")),
-            "has_note": bool(l.get("note_filename")),
+            "has_video": bool(l.get("video_url")),
+            "has_note": bool(l.get("note_url")),
             "note_filename": l.get("note_filename")
         })
 
@@ -118,16 +153,17 @@ def create_course():
     if not data.get("title") or not data.get("description"):
         return jsonify({"error": "শিরোনাম ও বিবরণ প্রয়োজন"}), 400
 
-    thumbnail = request.files.get("thumbnail")
-    thumbnail_data = None
-    if thumbnail:
-        raw = thumbnail.read()
-        if len(raw) > 5 * 1024 * 1024:
-            return jsonify({"error": "থাম্বনেইল ৫ মেগাবাইটের বেশি হতে পারবে না"}), 400
-        thumbnail_data = f"data:{thumbnail.mimetype};base64,{base64.b64encode(raw).decode()}"
+    thumbnail_url = None
+    thumbnail_file = request.files.get("thumbnail")
+    if thumbnail_file and thumbnail_file.filename:
+        try:
+            thumbnail_url = upload_thumbnail(thumbnail_file)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception:
+            return jsonify({"error": "থাম্বনেইল আপলোড করতে সমস্যা হয়েছে"}), 500
 
     tags = [t.strip() for t in data.get("tags", "").split(",") if t.strip()]
-
     try:
         price = float(data.get("price", 0))
         if price < 0:
@@ -139,7 +175,7 @@ def create_course():
         "title": data["title"].strip(),
         "description": data["description"].strip(),
         "long_description": data.get("long_description", "").strip(),
-        "thumbnail": thumbnail_data,
+        "thumbnail": thumbnail_url,
         "price": price,
         "category": data.get("category", "").strip(),
         "level": data.get("level", "প্রাথমিক"),
@@ -174,7 +210,6 @@ def update_course(course_id):
         return jsonify({"error": "অনুমতি নেই"}), 403
 
     data = request.form
-    thumbnail = request.files.get("thumbnail")
     update = {"updated_at": datetime.utcnow()}
 
     for field in ["title", "description", "long_description", "category", "level"]:
@@ -190,10 +225,16 @@ def update_course(course_id):
     if data.get("tags") is not None:
         update["tags"] = [t.strip() for t in data["tags"].split(",") if t.strip()]
 
-    if thumbnail:
-        raw = thumbnail.read()
-        if len(raw) <= 5 * 1024 * 1024:
-            update["thumbnail"] = f"data:{thumbnail.mimetype};base64,{base64.b64encode(raw).decode()}"
+    thumbnail_file = request.files.get("thumbnail")
+    if thumbnail_file and thumbnail_file.filename:
+        try:
+            # Delete old thumbnail from Cloudinary
+            delete_cloudinary_image(course.get("thumbnail"))
+            update["thumbnail"] = upload_thumbnail(thumbnail_file)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception:
+            return jsonify({"error": "থাম্বনেইল আপলোড করতে সমস্যা হয়েছে"}), 500
 
     db.courses.update_one({"_id": ObjectId(course_id)}, {"$set": update})
     return jsonify({"message": "কোর্স আপডেট হয়েছে"})
@@ -276,17 +317,31 @@ def delete_course(course_id):
     if str(course["instructor_id"]) != user_id and user["role"] != "admin":
         return jsonify({"error": "অনুমতি নেই"}), 403
 
-    # Delete all GridFS files for this course's lessons before removing them
-    fs = get_fs()
+    # Delete thumbnail from Cloudinary
+    delete_cloudinary_image(course.get("thumbnail"))
+
+    # Delete all Cloudinary assets for lessons in this course
     lessons_to_delete = list(db.lessons.find({"course_id": course_id}))
     for lesson in lessons_to_delete:
-        for field in ["video_file_id", "note_file_id"]:
-            fid = lesson.get(field)
-            if fid:
-                try:
-                    fs.delete(ObjectId(fid))
-                except Exception:
-                    pass
+        _delete_lesson_assets(lesson)
+
     db.courses.delete_one({"_id": ObjectId(course_id)})
     db.lessons.delete_many({"course_id": course_id})
     return jsonify({"message": "কোর্স মুছে ফেলা হয়েছে"})
+
+
+def _delete_lesson_assets(lesson):
+    """Delete Cloudinary video and note for a lesson (best-effort)."""
+    video_public_id = lesson.get("video_public_id")
+    if video_public_id:
+        try:
+            cloudinary.uploader.destroy(video_public_id, resource_type="video")
+        except Exception:
+            pass
+
+    note_public_id = lesson.get("note_public_id")
+    if note_public_id:
+        try:
+            cloudinary.uploader.destroy(note_public_id, resource_type="raw")
+        except Exception:
+            pass
